@@ -229,33 +229,32 @@ class SmileNet(torch.nn.Module):
         print(self.blackbox[-1].bias.shape)
         self.blackbox[-1].bias = torch.nn.Parameter(torch.tensor(basis.T @ self.xstar).reshape(-1).double())
         self.translate = torch.tensor(basis.T).double() # we get coefficients vector from v @ w.T (assuming w itself is a row vector)
+        self.scale = 1.0e8
 
-
-
-    def forward(self, x):
+    def forward(self, x, scale=None):
         control = self.blackbox(x)
-        sol = self.translate.T @ control.T # Outputs coefficients
-        # if not sanitycheck else sol, (torch.tensor(self.system) @ sol).reshape(-1,1)[int(-x.shape[1] / 2) :]
-        # print('Sol shape', sol.shape)
+        if scale is None:
+            scale = self.scale
+
+        sol = remove_arb(control, self.translate, self.boundaries, scale=scale)
         return sol 
 
     def train(self, data, strikes, epochs=100, optimizer=None):
-
-        scale = 1.0e7
+        scale=1.0e8
         lows, highs =  data[0, data.shape[1]//2:], data[0,:data.shape[1]//2]
         if optimizer is None:
-            optimizer = torch.optim.SGD(self.parameters(), lr=1e-06)
+            optimizer = torch.optim.AdamW(self.parameters(), lr=1e-06)
         for e in range(epochs):
             print('Epoch:',e)
             # Loss and prediction
-            pred = self.forward(data)
+            pred = self.forward(data, scale)
             polys = [np.polynomial.polynomial.Polynomial(list(reversed(pred[:,0].detach().numpy()[4*i:4*i+4]))) for i in range((pred.shape[0])//4)]
 
             # plot_polys([poly.deriv() for poly in polys], self.boundaries, e, 'dit')
             # plot_polys([poly.deriv(2) for poly in polys], self.boundaries, e, 'd2it')
 
             transformed = transform(pred, scale=scale)
-            loss = full_loss(pred, self.boundaries, strikes, lows, highs, scale=scale)
+            loss = get_observe_losses(pred, self.boundaries, strikes, lows, highs)
             plot_polys(polys, self.boundaries, e, 'it', extra_points=[(strikes, lows), (strikes, highs)], title=str(loss.item()))
 
             polys = [np.polynomial.polynomial.Polynomial(transformed.detach().numpy()[i,:]) for i in range(transformed.shape[0])]
@@ -268,6 +267,7 @@ class SmileNet(torch.nn.Module):
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
+
 
 
 def transform(sol, scale):
@@ -468,10 +468,10 @@ def plot_polys(polys, boundaries, num, name, title='', extra_points=None):
 
 def full_loss(coeffs, boundaries, strikes, lows, highs, scale=10000000):
     transformed = transform(coeffs, scale=scale)
-    loss = (scale * polyLoss.apply(transformed, boundaries))
+    loss = (scale * polyLoss.apply(transformed, boundaries)).sqrt()
     print("Arb loss:", loss)
-    if loss.item() <= 1.0e-7:
-        print('yes!')
+    if loss.item() > -1.0e-5:
+        # print('yes!')
         loss = loss + get_observe_losses(coeffs, boundaries, strikes, lows, highs)
     return loss
 
@@ -484,7 +484,7 @@ def get_observe_losses(coeffs, boundaries, strikes, lows, highs):
     last_bound = 0
     loss = torch.tensor(0.0).double()
     zero = torch.tensor(0.0).double()
-    # print(strikes.shape, lows.shape, highs.shape)
+    # print(strikes.shape, lows.sforhape, highs.shape)
     # print('Lens: ', len(polys), len(boundaries))
     for strike, low, high in zip(strikes, lows, highs):
         while last_bound < len(boundaries) - 2 and boundaries[last_bound] < strike:
@@ -503,3 +503,23 @@ def get_observe_losses(coeffs, boundaries, strikes, lows, highs):
         loss = loss + 0.5 * err + torch.max(err - out, zero)**4 + torch.max(err - out, zero)**2 
     print('Mid loss', loss.item() / len(strikes))
     return loss / len(strikes)
+
+def remove_arb(control, translate, boundaries, scale=1.0e7, tol=1.0e-7):
+
+    lr = 1.0e-5
+    max_epochs = 100
+    scale=1.0e8
+    for e in range(max_epochs):
+        sol = translate.T @ control.T
+        # polys = [np.polynomial.polynomial.Polynomial(list(reversed(pred[:,0].detach().numpy()[4*i:4*i+4]))) for i in range((pred.shape[0])//4)]
+        transformed = transform(sol, scale=scale)
+        loss = scale * polyLoss.apply(transformed, boundaries)
+        if loss < tol:
+            break
+        # loss.backward()
+        # optimizer.step()
+        # optimizer.zero_grad()
+        grad = torch.autograd.grad(loss, control, retain_graph=True)[0]
+        control = control - lr * grad
+    print("With remaining arb:", loss.item())
+    return sol # Returns control that satisfies arbitrage condition

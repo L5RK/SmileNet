@@ -30,3 +30,18 @@ def implied_vol(target_value, S, K, T, r, PRECISION = 1.0e-9, MAX_ITERATIONS = 2
 
 # Load data
 
+def get_datum(options, S, T, R):
+    # R = rates[(rates['date'] == date) & (rates['days'] == rate_dist)]['rate'][0] / 100
+    processed = options[['strike_price','best_bid','best_offer']]
+    processed['vol_high'] = processed.apply(lambda x: implied_vol(x['best_offer'], S, x['strike_price'], T, R), axis=1)
+    processed['vol_low'] = processed.apply(lambda x: implied_vol(x['best_bid'], S, x['strike_price'], T, R), axis=1)
+    processed['vol_mid'] = (processed['vol_high'] + processed['vol_low']) / 2
+    boundaries = processed['strike_price'].apply(np.log).to_numpy()
+    log_strikes = processed['strike_price'].apply(np.log).to_numpy()
+    inp_data = torch.tensor(np.vstack([processed['vol_high'].to_numpy().reshape(-1,1), processed['vol_low'].to_numpy().reshape(-1,1), log_strikes.reshape(-1,1)]))
+    S = torch.tensor(S).reshape(1,1)
+    T = torch.tensor(T).reshape(1,1)
+    R = torch.tensor(R).reshape(1,1)
+    inp_data = torch.vstack([inp_data, S, T, R])
+    print(inp_data)
+    return inp_data, log_strikes, 

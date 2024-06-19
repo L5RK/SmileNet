@@ -2,7 +2,6 @@ import torch
 import numpy as np
 from scipy.stats import norm
 from functools import partial
-import matplotlib.pyplot as plt
 
 # Neural Net:
 # Very simple rn - getting ideas down
@@ -40,7 +39,7 @@ def get_translation_matrix(knots, dof):
         system[3 * i+2, 4 * i+1] = 2
         system[3 * i+2, 4 *(i + 1)] = - 6 * x
         system[3 * i+2, 4 *(i + 1)+1] = - 2
-    print('System shape:', system.shape, 'With', len(knots),'knots')
+
     _, _, V = np.linalg.svd(system)
 
     # Find basis of solution space
@@ -60,8 +59,7 @@ def mid_constrained(strike_knots, mids, dof,  X):
     constraints = []
     # print(X.shape)
     # print(strike_knots)
-    for i, x in strike_knots[:-1]: # strike_knots are knots that correspond to a known strike price. Since C0 continuity already enforced, We only enforce one equality per knot on midprice
-        # print(i, x)
+    for i, x in strike_knots: # strike_knots are knots that correspond to a known strike price. Since C0 continuity already enforced, We only enforce one equality per knot on midprice
         new_arr = np.zeros(X.shape[1])
         new_arr[4 * i] = x ** 3
         new_arr[4 * i + 1] = x ** 2
@@ -70,15 +68,6 @@ def mid_constrained(strike_knots, mids, dof,  X):
         constraints += [new_arr]
         # print(new_arr, i,x)        
     # print('Xshape', X.shape)
-    new_arr = np.zeros(X.shape[1])
-    i, x = strike_knots[-1]
-    i = i - 1 # We now are taking the right constraint, before were taking left
-    new_arr[4 * i] = x ** 3
-    new_arr[4 * i + 1] = x ** 2
-    new_arr[4 * i + 2] = x
-    new_arr[4 * i + 3] = 1
-    constraints += [new_arr]
-
     Xdash = np.vstack([X]+constraints)
 
     Xinv = np.linalg.pinv(Xdash)
@@ -121,6 +110,7 @@ def simple_initialization(mids, strike_knots, dof, basis,  X):
     print(basis.shape)
     # Projection onto control points
     return basis.T @ solution
+
 
 
 
@@ -176,8 +166,6 @@ class SmileNet(torch.nn.Module):
     Next we need to understand the relationship between control points and the loss function. Say we have a loss function, l(A,x), where A is our coefficient vector
     then we get that dl / dci (control i) = dA/dci * dl /dA = normal loss * sum of A where A is in the eigenvector
 
-    1 poly: 2 boundaries
-    then 2 
 
     """
 
@@ -185,20 +173,14 @@ class SmileNet(torch.nn.Module):
         super().__init__()
         # Blackbox layers
 
-        dof = len(boundaries) + 4 - 2 # Last 2 boundaries do not impact dof
+        dof = len(boundaries) + 4
         strike_knots = []
         count = 0
-        # for i in range(len(boundaries)):
-        #     if boundaries[i] == strikes[count]:
-        #         strike_knots += [(i,boundaries[count])]
-        #         count += 1
-        for strike in strikes:
-            while count < len(boundaries) and boundaries[count] <= strike:
-                if boundaries[count] == strike:
-                    strike_knots += [(count, boundaries[count])]
+        for i in range(len(boundaries)):
+            if boundaries[i] == strikes[count]:
+                strike_knots += [(i,boundaries[count])]
                 count += 1
-        print('Strike knots shape', len(strike_knots))
-        basis, X = get_translation_matrix(boundaries[1:-1], dof)
+        basis, X = get_translation_matrix(boundaries, dof)
         _, xstar,xdash = mid_constrained(strike_knots, mids, dof, X)
         self.boundaries = boundaries
         self.system = X
@@ -221,8 +203,8 @@ class SmileNet(torch.nn.Module):
         self.xstar = xstar
         for i in self.blackbox:
             if not isinstance(i, torch.nn.LeakyReLU):
-                i.weight = torch.nn.Parameter(torch.zeros(i.weight.shape).double() / 100)
-                i.bias = torch.nn.Parameter(torch.zeros(i.bias.shape).double() / 100)
+                i.weight = torch.nn.Parameter(torch.zeros(i.weight.shape).double())
+                i.bias = torch.nn.Parameter(torch.zeros(i.bias.shape).double())
         print(self.xstar.shape)
         print(basis.shape)
         print((basis.T @ self.xstar).shape)
@@ -234,46 +216,35 @@ class SmileNet(torch.nn.Module):
 
     def forward(self, x):
         control = self.blackbox(x)
+
         sol = self.translate.T @ control.T # Outputs coefficients
         # if not sanitycheck else sol, (torch.tensor(self.system) @ sol).reshape(-1,1)[int(-x.shape[1] / 2) :]
-        # print('Sol shape', sol.shape)
         return sol 
 
-    def train(self, data, strikes, epochs=100, optimizer=None):
-
-        scale = 1.0e7
-        lows, highs =  data[0, data.shape[1]//2:], data[0,:data.shape[1]//2]
+    def train(self, data, epochs=10_000, optimizer=None):
         if optimizer is None:
-            optimizer = torch.optim.SGD(self.parameters(), lr=1e-06)
+            optimizer = torch.optim.SGD(self.parameters(), lr=1e-25)
         for e in range(epochs):
-            print('Epoch:',e)
+            print(e)
             # Loss and prediction
             pred = self.forward(data)
-            polys = [np.polynomial.polynomial.Polynomial(list(reversed(pred[:,0].detach().numpy()[4*i:4*i+4]))) for i in range((pred.shape[0])//4)]
-
-            # plot_polys([poly.deriv() for poly in polys], self.boundaries, e, 'dit')
-            # plot_polys([poly.deriv(2) for poly in polys], self.boundaries, e, 'd2it')
-
-            transformed = transform(pred, scale=scale)
-            loss = full_loss(pred, self.boundaries, strikes, lows, highs, scale=scale)
-            plot_polys(polys, self.boundaries, e, 'it', extra_points=[(strikes, lows), (strikes, highs)], title=str(loss.item()))
-
-            polys = [np.polynomial.polynomial.Polynomial(transformed.detach().numpy()[i,:]) for i in range(transformed.shape[0])]
-            plot_polys(polys, self.boundaries, e, 'tit',str(loss.item()))
-
+            transformed = transform(pred)
+            loss = torch.sqrt(-1 * polyLoss.apply(transformed, self.boundaries))
             print('Loss:', loss)
-
 
             # Backprop
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
 
+    def plot_output(self):
+        pass
 
-def transform(sol, scale):
+
+def transform(sol):
     # Assume sol is of form a0, b0, c0, d0, a1, b1, ...
     transforms = []
-    sol = sol[:,0] / scale
+    sol = sol[:,0]
     for i in range(0, sol.shape[0], 4):
         # Condition is (1 - kw' / 2w)^2 - w'^2/4(1/w + 1/4) + w''/2 >= 0
         # 1/(4w^2) (w'^2k^2) - w'^2 / 4w - w'k/w - w'^2 / 16 + w''/2 + 1
@@ -284,8 +255,7 @@ def transform(sol, scale):
         # Max degree is degree a^2 *  b^2 = degree(3) * degree(3) * degree(2) *degree(2) = degree(10)
 
         w = convertTensorPoly.apply(torch.flip(sol[i:(i+4)],(0,)))
-        # max_degree = w.degree() * 2 + (w.deriv()).degree() * 2
-        max_degree = 10
+        max_degree = w.degree() * 2 + (w.deriv()).degree() * 2
         preservingPolyMul = lambda x, y: differentiablePolyMul.apply(x, y, max_degree)
         # preservingTensorPoly = lambda x: convertTensorPoly.apply(x, max_degree)
 
@@ -388,9 +358,7 @@ class differentiablePolyEval(torch.autograd.Function):
     def forward(ctx, coeffs, x):
         # Scale is tuple (a, b) st result = poly1 * a + poly2 * b
         ctx.save_for_backward(coeffs, torch.tensor(x))
-        poly = np.polynomial.polynomial.Polynomial(coeffs.detach().numpy())
-        # print(poly)
-        # print('Inside', poly(x))
+        poly = np.polynomial.polynomial.Polynomial(coeffs)
         return torch.tensor(poly(x))
 
     def backward(ctx, grad_output):
@@ -399,7 +367,6 @@ class differentiablePolyEval(torch.autograd.Function):
         return_grad = torch.empty(coeffs.shape[0])
         for i in range(coeffs.shape[0]):
             return_grad[i] = x.item() ** i
-        return return_grad * grad_output, None
 
 
 class polyLoss(torch.autograd.Function):
@@ -427,18 +394,17 @@ class polyLoss(torch.autograd.Function):
             all_roots += roots.shape[0]
             roots = np.sort(roots)
             for lo, hi in zip([x0] + list(roots), list(roots) + [x1]):
-
                 integral = poly.integ()
                 loss += min(0, integral(hi) - integral(lo))
-                # print(lo, hi, poly(lo), poly(hi))
-                # print(min(0, integral(hi) - integral(lo)), roots.shape)
+                # print(lo, hi, integral(hi) - integral(lo))
                 for j in range(coeff_ders.shape[1]):
                     # spline i, coefficient j
                     if (polyder(lo) != 0) and (polyder(hi) != 0):
                         coeff_ders[i,j] += (-1 * poly(hi) * hi ** j / polyder(hi)) + (poly(lo) * lo ** j / polyder(lo))
             i += 1
+        print('All roots:', all_roots)
         ctx.save_for_backward(coeff_ders, bounds_ders)
-        return -1 * loss
+        return loss
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -447,59 +413,59 @@ class polyLoss(torch.autograd.Function):
         return coeff_ders, None
 
         
-def plot_polys(polys, boundaries, num, name, title='', extra_points=None):
-    # print("./"+name+str(num)+".png")
-    boundary_spaces = [np.linspace(x,y,num=1000) for x, y in zip(boundaries[:-1],boundaries[1:])]
+def plot_polys(polys, boundaries):
+    boundary_spaces = [np.linspace(x,y) for x, y in zip(boundaries[:-1],boundaries[1:])]
+    polys = [np.polynomial.polynomial.Polynomial(list(reversed(resn[4*i:4*i+4]))) for i in range((resn.shape[0] -1)//4)]
+    polys = polys[1:]
     plot_points = np.hstack([poly(space) for poly, space in zip(polys, boundary_spaces)])
-    # print('in plot')
-    # for i in range(len(boundary_spaces)):
-    #     print(polys[i])
-    #     print(boundary_spaces[i][0], boundary_spaces[i][-1], polys[i](boundary_spaces[i][0]),polys[i](boundary_spaces[i][-1]))
-    #     print('max', np.log(max([boundary_spaces[i][-1] ** j * polys[i].coef[j] for j in range(polys[i].coef.shape[0])])))
+    print(len(plot_points))
     points = np.hstack(boundary_spaces)
-    plt.plot(points, plot_points)
-    if extra_points is not None:
-        for x, y in extra_points:
-            plt.scatter(x, y)
-    # plt.vlines(boundaries, ymin = min(plot_points), ymax = max(plot_points), color = 'red')
-    plt.title(title)
-    plt.savefig("./"+name+str(num)+".png")
-    plt.close()
+    print(len(points))
 
-def full_loss(coeffs, boundaries, strikes, lows, highs, scale=10000000):
-    transformed = transform(coeffs, scale=scale)
-    loss = (scale * polyLoss.apply(transformed, boundaries))
-    print("Arb loss:", loss)
-    if loss.item() <= 1.0e-7:
-        print('yes!')
-        loss = loss + get_observe_losses(coeffs, boundaries, strikes, lows, highs)
-    return loss
+# Get minimum points, add translation factor
 
-def get_observe_losses(coeffs, boundaries, strikes, lows, highs):
-    # Pred: boundaries, strikes sorted
-    # print("Testing:: ")
-    # polys_test = [np.polynomial.polynomial.Polynomial(list(reversed(coeffs[:,0].detach().numpy()[4*i:4*i+4]))) for i in range((coeffs.shape[0])//4)]
+class polyCorrect(torch.autograd.Function):
+      
+    @staticmethod
+    def forward(ctx, cond_coeffs, bounds):
+        tol = 1.0e-5 # Tolerance for discarding imaginary roots
 
-    polys = [lambda x, p=coeffs[:,0][4*i:4*i+4].flip(dims=(0,)): differentiablePolyEval.apply(p, x) for i in range((coeffs.shape[0])//4)]
-    last_bound = 0
-    loss = torch.tensor(0.0).double()
-    zero = torch.tensor(0.0).double()
-    # print(strikes.shape, lows.shape, highs.shape)
-    # print('Lens: ', len(polys), len(boundaries))
-    for strike, low, high in zip(strikes, lows, highs):
-        while last_bound < len(boundaries) - 2 and boundaries[last_bound] < strike:
-            last_bound += 1
-        # print("--------")
-        predicted = polys[last_bound](strike)
-        # tester = polys_test[last_bound](strike)
-        mid = (high + low) / 2.0
-        out = (high - low) / 2.0
-        err = (predicted - mid).abs()
-        # print(predicted.item(), mid.item(), err.item(), (err + torch.max(err - out, zero)**2).item())
-        # print(torch.autograd.grad(err, coeffs, retain_graph=True))
-        # print(tester)
-        # print(polys_test[last_bound])
-        # print("-------------")
-        loss = loss + 0.5 * err + torch.max(err - out, zero)**4 + torch.max(err - out, zero)**2 
-    print('Mid loss', loss.item() / len(strikes))
-    return loss / len(strikes)
+        # 1. Convert into polynomials from output:
+        polys = [np.polynomial.polynomial.Polynomial(cond_coeffs[i,:]) for i in range(cond_coeffs.shape[0])]
+
+        # Polys is our list of piecewise condition polynomials
+        coeff_ders = torch.zeros(cond_coeffs.shape)
+        bounds_ders = torch.zeros(bounds.shape)
+        i = 0
+        all_roots = 0
+        loss = torch.tensor(0, dtype=torch.double)
+        for poly, (x0, x1) in zip(polys, zip(bounds[:-1],bounds[1:])):
+            # print("------------")
+            # print(poly.coef)
+            polyder = poly.deriv()
+            roots = polyder.roots()
+            roots = roots.real[abs(roots.imag) < tol]
+            roots = roots[(roots >= x0) & (roots <= x1)]
+            all_roots += roots.shape[0]
+            roots = np.sort(roots)
+            if roots.shape[0] == 0:
+                c = min(min(poly(x0), poly(x1), 0))
+                poly
+            for lo, hi in zip([x0] + list(roots), list(roots) + [x1]):
+                integral = poly.integ()
+                loss += min(0, integral(hi) - integral(lo))
+                # print(lo, hi, integral(hi) - integral(lo))
+                for j in range(coeff_ders.shape[1]):
+                    # spline i, coefficient j
+                    if (polyder(lo) != 0) and (polyder(hi) != 0):
+                        coeff_ders[i,j] += (-1 * poly(hi) * hi ** j / polyder(hi)) + (poly(lo) * lo ** j / polyder(lo))
+            i += 1
+        print('All roots:', all_roots)
+        ctx.save_for_backward(coeff_ders, bounds_ders)
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        coeff_ders, bounds_ders = ctx.saved_tensors
+        # print(coeff_ders.mean())
+        return coeff_ders, None
